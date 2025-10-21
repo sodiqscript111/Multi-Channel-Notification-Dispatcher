@@ -11,53 +11,69 @@ import (
 	"time"
 )
 
-func StartNotificationConsumer() {
+func StartNotificationConsumer(ctx context.Context) { // ✅ Accept context here
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"localhost:9092"},
 		Topic:   "notifications.send",
 		GroupID: "notifyx-consumers",
 	})
 
+	log.Println("✅ Kafka consumer started...")
+
 	for {
-		msg, err := reader.ReadMessage(context.Background())
-		if err != nil {
-			continue
-		}
+		select {
+		case <-ctx.Done(): // ✅ Graceful exit
+			log.Println("🛑 Kafka consumer stopping...")
+			_ = reader.Close() // ✅ Ensure reader closes properly
+			return
 
-		var event NotificationEvent
-		_ = json.Unmarshal(msg.Value, &event)
+		default:
+			// ✅ Use context-aware reading
+			msg, err := reader.ReadMessage(ctx)
+			if err != nil {
+				// If context is cancelled, return immediately to avoid infinite loop
+				if ctx.Err() != nil {
+					log.Println("⚠️ Kafka consumer read aborted due to shutdown")
+					return
+				}
+				continue
+			}
 
-		var recipient models.NotificationRecipient
-		if err := db.DB.First(&recipient, "id = ?", event.RecipientID).Error; err != nil {
-			continue
-		}
+			var event NotificationEvent
+			_ = json.Unmarshal(msg.Value, &event)
 
-		var notification models.Notification
-		if err := db.DB.First(&notification, "id = ?", event.NotificationID).Error; err != nil {
-			continue
-		}
+			var recipient models.NotificationRecipient
+			if err := db.DB.First(&recipient, "id = ?", event.RecipientID).Error; err != nil {
+				continue
+			}
 
-		success := simulateSend(notification.Channel, recipient.Recipient, notification.Message)
+			var notification models.Notification
+			if err := db.DB.First(&notification, "id = ?", event.NotificationID).Error; err != nil {
+				continue
+			}
 
-		if !success {
-			fallback := fallbackChannel(notification.Channel)
-			log.Printf("Primary %s failed, trying  fallback: %s", notification.Channel, fallback)
-			success = simulateSend(fallback, recipient.Recipient, notification.Message)
-		}
+			success := simulateSend(notification.Channel, recipient.Recipient, notification.Message)
 
-		if success {
-			db.DB.Model(&recipient).Updates(map[string]interface{}{
-				"status":        "sent",
-				"attempt_count": recipient.AttemptCount + 1,
-				"updated_at":    time.Now(),
-			})
-		} else {
-			db.DB.Model(&recipient).Updates(map[string]interface{}{
-				"status":        "failed",
-				"attempt_count": recipient.AttemptCount + 1,
-				"last_error":    "All channels failed",
-				"updated_at":    time.Now(),
-			})
+			if !success {
+				fallback := fallbackChannel(notification.Channel)
+				log.Printf("Primary %s failed, trying fallback: %s", notification.Channel, fallback)
+				success = simulateSend(fallback, recipient.Recipient, notification.Message)
+			}
+
+			if success {
+				db.DB.Model(&recipient).Updates(map[string]interface{}{
+					"status":        "sent",
+					"attempt_count": recipient.AttemptCount + 1,
+					"updated_at":    time.Now(),
+				})
+			} else {
+				db.DB.Model(&recipient).Updates(map[string]interface{}{
+					"status":        "failed",
+					"attempt_count": recipient.AttemptCount + 1,
+					"last_error":    "All channels failed",
+					"updated_at":    time.Now(),
+				})
+			}
 		}
 	}
 }
